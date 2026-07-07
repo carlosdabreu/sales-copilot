@@ -15,15 +15,35 @@ export async function POST(request: Request) {
       );
     }
 
+    if (audioFile.size === 0) {
+      return NextResponse.json(
+        { success: false, error: "Audio file is empty." },
+        { status: 400 }
+      );
+    }
+
+    console.log("Received audio chunk:", {
+      name: audioFile.name,
+      type: audioFile.type,
+      size: audioFile.size,
+    });
+
     const transcription = await openai.audio.transcriptions.create({
       file: audioFile,
       model: "gpt-4o-mini-transcribe",
+      prompt:
+        "This is a sales call. Transcribe clearly. Preserve questions, objections, pricing concerns, implementation concerns, ROI concerns, and security concerns.",
     });
 
     return NextResponse.json({
       success: true,
-      text: transcription.text,
+      text: transcription.text || "",
       model: "gpt-4o-mini-transcribe",
+      audio: {
+        name: audioFile.name,
+        type: audioFile.type,
+        size: audioFile.size,
+      },
     });
   } catch (error) {
     console.error("Audio transcription failed:", error);

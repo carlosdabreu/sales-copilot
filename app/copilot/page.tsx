@@ -60,6 +60,41 @@ type FinalCallSummary = {
   };
 };
 
+function getSupportedAudioConfig() {
+  const options = [
+    {
+      mimeType: "audio/webm;codecs=opus",
+      extension: "webm",
+    },
+    {
+      mimeType: "audio/webm",
+      extension: "webm",
+    },
+    {
+      mimeType: "audio/mp4",
+      extension: "mp4",
+    },
+    {
+      mimeType: "audio/mpeg",
+      extension: "mp3",
+    },
+  ];
+
+  for (const option of options) {
+    if (
+      typeof MediaRecorder !== "undefined" &&
+      MediaRecorder.isTypeSupported(option.mimeType)
+    ) {
+      return option;
+    }
+  }
+
+  return {
+    mimeType: "",
+    extension: "webm",
+  };
+}
+
 export default function SalesCopilotPage() {
   const [prospectCompany, setProspectCompany] = useState("");
   const [callType, setCallType] = useState("Discovery");
@@ -76,11 +111,12 @@ export default function SalesCopilotPage() {
   const [finalizing, setFinalizing] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [listeningStatus, setListeningStatus] = useState("");
+  const [debugInfo, setDebugInfo] = useState("");
   const [error, setError] = useState("");
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunkIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const shouldKeepListeningRef = useRef(false);
   const accumulatedTranscriptRef = useRef("");
   const lastAutoTurnRef = useRef("");
   const cardRef = useRef<HTMLDivElement | null>(null);
@@ -157,9 +193,9 @@ export default function SalesCopilotPage() {
     return pieces.slice(contextStart, prospectMomentIndex + 1).join(" ");
   }
 
-  async function transcribeAudioChunk(audioBlob: Blob) {
+  async function transcribeAudioChunk(audioBlob: Blob, extension: string) {
     const formData = new FormData();
-    formData.append("audio", audioBlob, "sales-call-chunk.webm");
+    formData.append("audio", audioBlob, `sales-call-chunk.${extension}`);
 
     const response = await fetch("/api/transcribe-audio", {
       method: "POST",
@@ -172,6 +208,10 @@ export default function SalesCopilotPage() {
       console.error("Transcription error:", result);
       throw new Error(result.error || result.details || "Transcription failed.");
     }
+
+    setDebugInfo(
+      `Last chunk transcribed. Type: ${audioBlob.type || "unknown"} | Size: ${audioBlob.size} bytes`
+    );
 
     return result.text as string;
   }
@@ -222,9 +262,15 @@ export default function SalesCopilotPage() {
   }
 
   async function handleTranscribedText(text: string) {
-    if (!text || text.trim().length === 0) return;
+    const cleanedText = text.trim();
 
-    const nextTranscript = `${accumulatedTranscriptRef.current} ${text}`.trim();
+    if (!cleanedText) {
+      setDebugInfo("Last chunk returned no transcript text.");
+      return;
+    }
+
+    const nextTranscript =
+      `${accumulatedTranscriptRef.current} ${cleanedText}`.trim();
 
     accumulatedTranscriptRef.current = nextTranscript;
     setLiveTranscript(nextTranscript);
@@ -243,27 +289,57 @@ export default function SalesCopilotPage() {
     }
   }
 
-  function recordChunk(stream: MediaStream) {
-    const mediaRecorder = new MediaRecorder(stream, {
-      mimeType: "audio/webm",
-    });
+  function recordNextChunk(stream: MediaStream) {
+    if (!shouldKeepListeningRef.current) return;
+
+    const audioConfig = getSupportedAudioConfig();
+
+    const recorderOptions =
+      audioConfig.mimeType.length > 0
+        ? {
+            mimeType: audioConfig.mimeType,
+          }
+        : undefined;
+
+    let mediaRecorder: MediaRecorder;
+
+    try {
+      mediaRecorder = new MediaRecorder(stream, recorderOptions);
+    } catch (err) {
+      console.error("MediaRecorder creation failed:", err);
+      setError(
+        "Could not start audio recorder. Try Chrome if you are using Safari."
+      );
+      stopListening();
+      return;
+    }
 
     const chunks: Blob[] = [];
 
     mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
+      if (event.data && event.data.size > 0) {
         chunks.push(event.data);
       }
     };
 
     mediaRecorder.onstop = async () => {
-      if (chunks.length === 0) return;
+      if (!shouldKeepListeningRef.current && chunks.length === 0) return;
 
-      const audioBlob = new Blob(chunks, { type: "audio/webm" });
+      if (chunks.length === 0) {
+        setDebugInfo("No audio captured in last chunk.");
+        if (shouldKeepListeningRef.current) {
+          window.setTimeout(() => recordNextChunk(stream), 500);
+        }
+        return;
+      }
+
+      const audioBlob = new Blob(chunks, {
+        type: audioConfig.mimeType || "audio/webm",
+      });
 
       try {
         setListeningStatus("Transcribing latest audio chunk...");
-        const text = await transcribeAudioChunk(audioBlob);
+        const text = await transcribeAudioChunk(audioBlob, audioConfig.extension);
         setListeningStatus("Listening for prospect questions and objections...");
         await handleTranscribedText(text);
       } catch (err) {
@@ -271,17 +347,25 @@ export default function SalesCopilotPage() {
         setError(
           err instanceof Error ? err.message : "Audio transcription failed."
         );
+      } finally {
+        if (shouldKeepListeningRef.current) {
+          window.setTimeout(() => recordNextChunk(stream), 500);
+        }
       }
     };
 
     mediaRecorderRef.current = mediaRecorder;
     mediaRecorder.start();
 
-    setTimeout(() => {
+    setDebugInfo(
+      `Recording chunk using ${audioConfig.mimeType || "browser default audio format"}...`
+    );
+
+    window.setTimeout(() => {
       if (mediaRecorder.state === "recording") {
         mediaRecorder.stop();
       }
-    }, 8000);
+    }, 10000);
   }
 
   async function startListening() {
@@ -293,20 +377,25 @@ export default function SalesCopilotPage() {
       setLiveTranscript("");
       setTranscript("");
       setLatestProspectTurn("");
+      setDebugInfo("");
       accumulatedTranscriptRef.current = "";
       lastAutoTurnRef.current = "";
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
       streamRef.current = stream;
+      shouldKeepListeningRef.current = true;
 
       setIsListening(true);
       setListeningStatus("Listening for prospect questions and objections...");
 
-      recordChunk(stream);
-
-      chunkIntervalRef.current = setInterval(() => {
-        recordChunk(stream);
-      }, 9000);
+      recordNextChunk(stream);
     } catch (err) {
       console.error("Mic capture failed:", err);
       setError(
@@ -316,14 +405,12 @@ export default function SalesCopilotPage() {
       );
       setIsListening(false);
       setListeningStatus("");
+      shouldKeepListeningRef.current = false;
     }
   }
 
   function stopListening() {
-    if (chunkIntervalRef.current) {
-      clearInterval(chunkIntervalRef.current);
-      chunkIntervalRef.current = null;
-    }
+    shouldKeepListeningRef.current = false;
 
     if (mediaRecorderRef.current?.state === "recording") {
       mediaRecorderRef.current.stop();
@@ -379,12 +466,14 @@ export default function SalesCopilotPage() {
   }
 
   function clearSession() {
+    stopListening();
     setLiveTranscript("");
     setTranscript("");
     setLatestProspectTurn("");
     setCard(null);
     setFinalSummary(null);
     setCurrentCallId(null);
+    setDebugInfo("");
     setError("");
     accumulatedTranscriptRef.current = "";
     lastAutoTurnRef.current = "";
@@ -516,6 +605,12 @@ export default function SalesCopilotPage() {
             <p className="mt-3 text-sm text-gray-500">{listeningStatus}</p>
           )}
 
+          {debugInfo && (
+            <p className="mt-2 rounded-lg bg-gray-50 p-3 text-xs text-gray-500">
+              {debugInfo}
+            </p>
+          )}
+
           {currentCallId && (
             <p className="mt-2 text-xs text-gray-500">
               Active call session saved.
@@ -583,7 +678,10 @@ export default function SalesCopilotPage() {
         </div>
 
         {finalSummary && (
-          <div ref={finalSummaryRef} className="mt-6 rounded-xl border bg-white p-6 shadow-sm">
+          <div
+            ref={finalSummaryRef}
+            className="mt-6 rounded-xl border bg-white p-6 shadow-sm"
+          >
             <h2 className="text-2xl font-bold text-gray-900">
               Final Call Summary
             </h2>
@@ -621,34 +719,6 @@ export default function SalesCopilotPage() {
                   Objections
                 </h3>
                 {renderList(finalSummary.objections)}
-              </div>
-            </div>
-
-            <div className="mt-6 grid gap-4 md:grid-cols-2">
-              <div className="rounded-lg bg-gray-50 p-5">
-                <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-                  MEDDIC
-                </h3>
-                <div className="mt-3 space-y-2 text-sm text-gray-700">
-                  <p><strong>Metrics:</strong> {finalSummary.meddic?.metrics}</p>
-                  <p><strong>Economic Buyer:</strong> {finalSummary.meddic?.economic_buyer}</p>
-                  <p><strong>Decision Criteria:</strong> {finalSummary.meddic?.decision_criteria}</p>
-                  <p><strong>Decision Process:</strong> {finalSummary.meddic?.decision_process}</p>
-                  <p><strong>Identify Pain:</strong> {finalSummary.meddic?.identify_pain}</p>
-                  <p><strong>Champion:</strong> {finalSummary.meddic?.champion}</p>
-                </div>
-              </div>
-
-              <div className="rounded-lg bg-gray-50 p-5">
-                <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500">
-                  BANT
-                </h3>
-                <div className="mt-3 space-y-2 text-sm text-gray-700">
-                  <p><strong>Budget:</strong> {finalSummary.bant?.budget}</p>
-                  <p><strong>Authority:</strong> {finalSummary.bant?.authority}</p>
-                  <p><strong>Need:</strong> {finalSummary.bant?.need}</p>
-                  <p><strong>Timeline:</strong> {finalSummary.bant?.timeline}</p>
-                </div>
               </div>
             </div>
 
